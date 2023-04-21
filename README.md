@@ -397,7 +397,81 @@ Percentage of the requests served within a certain time (ms)
  100%   1362 (longest request)
 ```
 
-トータルデミルと、最大が 1362 ミリ秒、最小が 53 ミリ秒。
+トータルでみると、最大が 1362 ミリ秒、最小が 53 ミリ秒。
 この最大値が許容できれば、REST API として利用するのもアリかもしれない。
 
+## 関数が二つある場合の Spring Cloud Function AWS Adapter の動作
+
+上で、「今回は、関数が一つだったので問題無く動作したが、関数が複数ある場合は、（path指定ではない）関数の指定が必要になる」と記述したが、その動作を確認する。
+
+### 関数クラスの追加
+
+Uppercase関数クラスに加え、文字列を逆順にする Reverse関数クラスを作成する
+
+```java
+public class Reverse implements Function<String, String> {
+    @Override
+    public String apply(String s) {
+        return new StringBuilder(s).reverse().toString();
+    }
+}
+```
+
+これで、プロジェクト内に uppercase と reverse という二つの関数が存在する事になる
+
+### デプロイ
+`gradle build` でビルドし、AWS Lambda にデプロイ後、バージョン発行を行う。
+
+### 動作確認
+いままでと同様の下記コマンドを実行してみる
+
+```shell
+curl https://*****.lambda-url.ap-northeast-1.on.aws/ -H "Content-Type: text/plain" -d "hello, spring cloud function!" \
+    -w " - http_code: %{http_code}, time_total: %{time_total}\n"
+```
+
+結果として、以下のテキストが返ってくる
+
+```text
+Internal Server Error - http_code: 502, time_total: 1.872654
+```
+
+CloudWatchLogs を確認すると、下記のようなログが出力されている
+
+```text
+Failed to establish route, since neither were provided: 'spring.cloud.function.definition' as Message header or as application property or 'spring.cloud.function.routing-expression' as application property. 
+```
+
+ざっくりいうと、「適切な情報が与えられなかったので、ルートを特定できませんでした」ということらしい<br>
+これは、関数が二つあるために、どちらを呼び出すかわからないためだ。<br>
+なので、下記のように、ヘッダーに `spring.cloud.function.definition:uppercase` を追加する
+
+```shell
+curl https://*****.lambda-url.ap-northeast-1.on.aws/ -H "Content-Type: text/plain" -d "hello, spring cloud function!" \
+    -H "spring.cloud.function.definition:uppercase"  \
+    -w " - http_code: %{http_code}, time_total: %{time_total}\n"
+```
+
+以下の様に結果が返る
+
+```text
+"HELLO, SPRING CLOUD FUNCTION!" - http_code: 200, time_total: 0.113230
+```
+
+正しく `uppercase` 関数クラスが呼び出されていることがわかる。<br>
+先ほどのコマンドで、ヘッダに`spring.cloud.function.definition:reverse` を指定して実行してみる
+
+```shell
+curl https://*****.lambda-url.ap-northeast-1.on.aws/ -H "Content-Type: text/plain" -d "hello, spring cloud function!" \
+    -H "spring.cloud.function.definition:reverse"  \
+    -w " - http_code: %{http_code}, time_total: %{time_total}\n"
+```
+
+結果は、次の通り
+
+```text
+"!noitcnuf duolc gnirps ,olleh" - http_code: 200, time_total: 0.225064
+```
+
+正しく `reverse` 関数が呼ばれている。
 
