@@ -1,9 +1,9 @@
-# Spring Cloud Function サンプル
+# Spring Cloud Function + AWS Lambda サンプル
 
 ## Spring Cloud Function で REST API を作る
 ### プロジェクト作成
 
-[Spring Initalizr](https://start.spring.io/) を使って、アプリケーションの雛形を作成する<br>
+[Spring Initializr](https://start.spring.io/) を使って、アプリケーションの雛形を作成する<br>
 
 * gradle プロジェクトを採用
 * Dependencies には、 `Function` を追加する。<br>
@@ -75,7 +75,14 @@ spring:
 
 ### 動作確認
 
-`gradle build` でビルドすると、Springアプリケーションが起動するので、下記 curl コマンドで動作確認
+`gradle build` でビルドすると、 `build.libs` 以下に jar ファイルが生成される。<br>
+以下のコマンドでアプリケーション起動
+
+```shell
+java -jar ./build/libs/sample-0.0.1-SNAPSHOT.jar
+```
+
+下記 curl コマンドで動作確認
 
 ```shell
 curl localhost:8080/uppercase -H "Content-Type: text/plain" -d "hello, spring cloud function!"
@@ -84,3 +91,140 @@ curl localhost:8080/uppercase -H "Content-Type: text/plain" -d "hello, spring cl
 実行すると、`HELLO, SPRING CLOUD FUNCTION!` が返ってくる。<br>
 Spring Cloud Function は、関数クラス（または関数Bean）をURLにマッピングして、REST API として動作させる。<br>
 今回の場合は、関数クラス `Uppercase` が `/uppercase` にマッピングされている。 
+
+## Spring Cloud Function アプリケーションを、AWS Lambda 関数にする
+
+### 依存関係を追加
+
+AWS Lambda 対応に必要な依存関係を追加する
+
+```groovy
+ext {
+    set('springCloudVersion', "2021.0.6")
+    set('awsLambdaCoreVersion', '1.2.2') // 追加
+    set('awsLambdaEventsVersion', '3.11.1') // 追加
+}
+
+dependencies {
+    implementation 'org.springframework.cloud:spring-cloud-starter-function-webflux'
+    implementation 'org.springframework.cloud:spring-cloud-function-adapter-aws' // 追加
+    compileOnly "com.amazonaws:aws-lambda-java-core:${awsLambdaCoreVersion}"  // 追加
+    compileOnly "com.amazonaws:aws-lambda-java-events:${awsLambdaEventsVersion}"  // 追加
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+}
+```
+
+### シェーディングされた jar を作るためにプラグインを導入する
+
+build.gradle を以下の様に編集し、Shade プラグイン , Thin プラグインを追加する
+
+```groovy
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '2.7.10'
+    id 'io.spring.dependency-management' version '1.0.15.RELEASE'
+    id 'com.github.johnrengelman.shadow' version '7.1.2' // 追加
+    id 'org.springframework.boot.experimental.thin-launcher' version '1.0.29.RELEASE' // 追加
+}
+```
+
+### shadowJar を生成するタスクを追加
+
+aws にアップロードするための jar を生成するタスクを追加する
+
+```groovy
+import com.github.jengelman.gradle.plugins.shadow.transformers.*
+
+shadowJar {
+	archiveClassifier.set('aws')
+	dependencies {
+		exclude(dependency('org.springframework.cloud:spring-cloud-function-webflux'))
+	}
+	// Required for Spring
+	mergeServiceFiles()
+	append 'META-INF/spring.handlers'
+	append 'META-INF/spring.schemas'
+	append 'META-INF/spring.tooling'
+	transform(PropertiesFileTransformer) {
+		paths = ['META-INF/spring.factories']
+		mergeStrategy = "append"
+	}
+}
+```
+
+### ビルド時に、thinJar, shadowJar を同時に作れるよう依存関係を追加
+
+```groovy
+assemble.dependsOn = [shadowJar, thinJar]
+```
+
+### AWS Lambda で実行可能にするために、マニフェストにメインクラスを指定
+
+```groovy
+jar {
+	manifest {
+		attributes 'Main-Class': 'com.example.sample.SampleApplication'
+	}
+}
+```
+
+### デプロイ
+
+`gradle build` でビルドすると、 `build.libs` 以下に jar ファイルが2種類生成される。<br>
+このうち、 `-aws.jar` が末尾になっているものが、AWS Lambda 用の jar ファイルとなる。<br>
+
+**なお、この時点で通常の jar ファイルはアプリ起動できなくなる（要調査：thin-launcherの動作を確認）**<br>
+が、今回の目的は AWS Lambda 関数として動かすことなので、いったん無視する。
+
+上記で作成された `*-aws.jar` を、AWS Lambda 関数として登録する。<br>
+コンソールで実行しても良いが、AWS CLI を利用して、下記コマンドでも生成できる
+
+```shell
+aws lambda create-function --role [実行ロールのARN] \
+  --function-name SpringCloudFunctionSample \
+  --zip-file fileb://build/libs/sample-0.0.1-SNAPSHOT-aws.jar \
+  --handler org.springframework.cloud.function.adapter.aws.FunctionInvoker \
+  --description "Spring Cloud Function Adapter Example" \
+  --runtime java11 \
+  --timeout 30 \
+  --memory-size 2048 \
+  --publish
+```
+
+**handler の指定が、`org.springframework.cloud.function.adapter.aws.FunctionInvoker` であることに注意**<br>
+Spring Cloud Function （の AWS Adapter） は、上記ハンドラを起点として、アプリケーションに登録されている関数を呼び出す。<br>
+
+### 動作確認
+
+動作確認として、登録した関数に AWS Lambda Function URL を作成して、curl コマンドを投げる<br>
+起動時間などを含めたパフォーマンスを計測するため、 `-w` オプションを付ける
+
+```shell
+curl https://*****.lambda-url.ap-northeast-1.on.aws/ -H "Content-Type: text/plain" -d "hello, spring cloud function!" \
+  -w " - http_code: %{http_code}, time_total: %{time_total}\n"
+```
+
+URL の指定に、path が無いことに注意<br>
+Spring Cloud Function AWS Adapter では、ひとつの関数だけが AWS Lambda 関数としてバインドされるので、path による指定はできない<br>
+今回は、関数が一つだったので問題無く動作したが、関数が複数ある場合は、（path指定ではない）関数の指定が必要になる<br>
+(これについてはあとでかく)
+
+上記結果は下記のようになった。
+
+```shell
+"HELLO, SPRING CLOUD FUNCTION!" - http_code: 200, time_total: 5.306902
+```
+
+AWS Lambda 関数として動作していることがわかる。<br>
+トータル時間が `5秒` となっているのは、いわゆる Java のコールドスタート問題で、Spring の起動に時間がかかっているため。<br>
+なお、この直後にもういちど同じコマンドを実行すると、以下の様になった
+
+```shell
+"HELLO, SPRING CLOUD FUNCTION!" - http_code: 200, time_total: 0.069804
+```
+
+すでに起動しているので、実行時間は `0.07秒` となっている。<br>
+しかし、AWS Lambda はずっと起動しっぱなしではないし、同時接続数が増えるとコールドスタートが発生する可能性があるので、このままでは WEBサービスの API としては使いにくい。
+
+これに対して、これまではNativeイメージを作成して起動時間を短くすることが対策として考えられていたが、[AWS re:Invent 2022 で AWS Lambda SnapStart が発表](https://aws.amazon.com/jp/about-aws/whats-new/2022/11/aws-lambda-snapstart-java-functions/) された。<br>
+SnapStart が有効か確認することにする。
