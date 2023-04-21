@@ -18,6 +18,7 @@ ext {
     set('springCloudVersion', "2021.0.6")
     set('awsLambdaCoreVersion', '1.2.2')
     set('awsLambdaEventsVersion', '3.11.1')
+    set('cracVersion', '0.1.3')
 }
 
 dependencies {
@@ -25,6 +26,7 @@ dependencies {
     implementation 'org.springframework.cloud:spring-cloud-function-adapter-aws'
     compileOnly "com.amazonaws:aws-lambda-java-core:${awsLambdaCoreVersion}"
     compileOnly "com.amazonaws:aws-lambda-java-events:${awsLambdaEventsVersion}"
+    implementation "io.github.crac:org-crac:${cracVersion}"
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
 }
 

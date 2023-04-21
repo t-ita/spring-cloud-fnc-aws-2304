@@ -211,7 +211,7 @@ Spring Cloud Function AWS Adapter では、ひとつの関数だけが AWS Lambd
 
 上記結果は下記のようになった。
 
-```shell
+```text
 "HELLO, SPRING CLOUD FUNCTION!" - http_code: 200, time_total: 5.306902
 ```
 
@@ -219,7 +219,7 @@ AWS Lambda 関数として動作していることがわかる。<br>
 トータル時間が `5秒` となっているのは、いわゆる Java のコールドスタート問題で、Spring の起動に時間がかかっているため。<br>
 なお、この直後にもういちど同じコマンドを実行すると、以下の様になった
 
-```shell
+```text
 "HELLO, SPRING CLOUD FUNCTION!" - http_code: 200, time_total: 0.069804
 ```
 
@@ -228,3 +228,176 @@ AWS Lambda 関数として動作していることがわかる。<br>
 
 これに対して、これまではNativeイメージを作成して起動時間を短くすることが対策として考えられていたが、[AWS re:Invent 2022 で AWS Lambda SnapStart が発表](https://aws.amazon.com/jp/about-aws/whats-new/2022/11/aws-lambda-snapstart-java-functions/) された。<br>
 SnapStart が有効か確認することにする。
+
+## AWS Lambda SnapStart に対応する
+
+### AWS Lambda SnapStart とは
+
+[AWS Lambda SnapStart](https://aws.amazon.com/jp/blogs/news/new-accelerate-your-lambda-functions-with-lambda-snapstart/) は、Java で開発が進められている [CRaC](https://openjdk.org/projects/crac/) を転用したもの<br>
+CRaC は、Javaのプロセスイメージをスナップショットとして取得し、再起動時にスナップショットからプロセスを復元することで、Java特有の起動の遅さを解決する技術。<br>
+
+### AWS Lambda の設定
+
+SnapStart を有効にするのは簡単で、コンソールでは関数の一般設定で、SnapStart の項目を `None` から `PublishedVersions` に変更すると有効になる。<br>
+AWS CLI では、以下の様なコマンドになる。
+
+```shell
+aws lambda update-function-configuration --function-name SpringCloudFunctionSample \
+  --snap-start ApplyOn=PublishedVersions
+```
+
+以降、バージョンを作成する度に、スナップショットが取得される。
+AWS CLI では、以下の様なコマンドになる。
+
+```shell
+aws lambda publish-version --function-name SpringCloudFunctionSample
+```
+
+これでバージョンが作成される。<br>
+CloudWatchでログを見ると、INIT START して Spring が起動しているログが確認できる。<br>
+
+```text
+INIT_START Runtime Version: java:11.v19	Runtime Version ARN: arn:aws:lambda:ap-northeast-1::runtime:*****
+（中略）
+:: Spring Boot ::               (v2.7.10)
+（中略）
+```
+
+このバージョンに対して AWS Lambda Function URL を作成して、下記 curl コマンドを投げる
+
+```shell
+curl https://*****.lambda-url.ap-northeast-1.on.aws/ -H "Content-Type: text/plain" -d "hello, spring cloud function!" \
+  -w " - http_code: %{http_code}, time_total: %{time_total}\n"
+```
+
+結果は以下の様になった
+
+```text
+"HELLO, SPRING CLOUD FUNCTION!" - http_code: 200, time_total: 1.452490
+```
+
+トータルタイムが `1.4秒` になっており、70% 高速化していることがわかる。<br>
+なお、CloudWatch のログを確認すると、以下の様に出力されている。
+
+```text
+RESTORE_START Runtime Version: java:11.v19	Runtime Version ARN: arn:aws:lambda:ap-northeast-1::runtime:***
+RESTORE_REPORT Restore Duration: 315.26 ms
+```
+
+スナップショットから `300ms` かけて復元したことが確認できる。
+
+### ランタイムフックの設定
+
+SnapStart によって AWS Lambda の起動が高速化されることが確認できた。<br>
+しかし、SnapStart はプロセスのスナップショットをとるという仕組み上、プロセスに状態を保持すると、その状態が使い回されてしまう。<br>
+例えば、以下の様な場合に考慮の必要がありそう<br>
+* RDSとの接続状態
+* 認証情報
+* 処理で利用する一時データ
+* 一意性が必要名データ
+こうした場合に対処するために、ランタイムフックを利用して、復元時に実行する動作を設定出来るようになっている<br>
+ランタイムフックの実装は、以下のように行う。
+
+まず、CRaCの依存性を build.gradle 追加する
+
+```groovy
+ext {
+    set('springCloudVersion', "2021.0.6")
+    set('awsLambdaCoreVersion', '1.2.2')
+    set('awsLambdaEventsVersion', '3.11.1')
+    set('cracVersion', '0.1.3') // 追加
+}
+
+dependencies {
+    implementation 'org.springframework.cloud:spring-cloud-starter-function-webflux'
+    implementation 'org.springframework.cloud:spring-cloud-function-adapter-aws'
+    compileOnly "com.amazonaws:aws-lambda-java-core:${awsLambdaCoreVersion}"
+    compileOnly "com.amazonaws:aws-lambda-java-events:${awsLambdaEventsVersion}"
+    implementation "io.github.crac:org-crac:${cracVersion}" // 追加
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+}
+```
+
+実装した関数に、CRaC の `Resource` インターフェースを実装し、メソッドをオーバーライドする。<br>
+また、コンストラクタで関数クラスをコンテキストに登録する<br>
+
+```java
+public class Uppercase implements Function<String, String>, Resource {
+    
+    private static final Logger logger = LoggerFactory.getLogger(Uppercase.class);
+
+    public Uppercase() {
+        Core.getGlobalContext().register(this); // CRaC のグローバルコンテキストに登録
+    }
+
+    @Override
+    public void beforeCheckpoint(Context<? extends Resource> context) throws Exception {
+        logger.info("Before checkpoint");
+        // チェックポイント作成前の操作をここに書く
+    }
+
+    @Override
+    public void afterRestore(Context<? extends Resource> context) throws Exception {
+        logger.info("After restore");
+        // スナップショットからの復元時の操作をここに書く
+    }
+
+    @Override
+    public String apply(String s) {
+        return s.toUpperCase();
+    }
+}
+```
+
+上記変更を行ってデプロイし、確認用の curl コマンドを投げると以下の様な結果が返ってきた
+
+```text
+"HELLO, SPRING CLOUD FUNCTION!" - http_code: 200, time_total: 1.295677
+```
+
+コンテキストに追加する処理を書いたせいか、実行時間が `1.4秒` -> `1.2秒` になっている。誤差かもしれないが。
+
+なお、CloudWatchLogs でログを見ると、以下の様なログが出力されている
+
+```text
+2023-04-21 02:47:55.708  INFO 8 --- [           main] com.example.sample.functions.Uppercase   : After restore
+```
+
+ランタイムフックが正しく動作していることがわかる。
+
+### 同時接続での速度確認
+
+Java で AWS Lambda を実装する場合の問題は、同時接続が発生したときにコールドスタートが多発して速度に問題が出ることだった。<br>
+そこで、[Apache Bench](https://httpd.apache.org/docs/2.4/programs/ab.html) を利用して、同時接続が発生した場合のパフォーマンスを測定する。
+
+```shell
+ab -n 100 -c 10 
+```
+
+上記コマンドで、リクエスト 100 件を、並行数 10 で行う。イメージとしては、10ユーザーが同時に10リクエストを要求している感じ。
+結果は、以下の通り
+
+```text
+Connection Times (ms)
+              min  mean[+/-sd] median   max
+Connect:       27   71  33.4     68     156
+Processing:    23  160 304.9     57    1286
+Waiting:       23  156 305.6     52    1285
+Total:         53  230 308.2    127    1362
+
+Percentage of the requests served within a certain time (ms)
+  50%    127
+  66%    171
+  75%    183
+  80%    211
+  90%    916
+  95%   1118
+  98%   1285
+  99%   1362
+ 100%   1362 (longest request)
+```
+
+トータルデミルと、最大が 1362 ミリ秒、最小が 53 ミリ秒。
+この最大値が許容できれば、REST API として利用するのもアリかもしれない。
+
+
